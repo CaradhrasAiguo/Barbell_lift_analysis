@@ -1,0 +1,297 @@
+---
+title: "Barbell lift analysis"
+author: "KHYS / kshu"
+date: "1 August 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, cache=TRUE}
+# gc()
+# .rs.restartR()
+knitr::opts_chunk$set(echo = FALSE)
+require(knitr); library(caret); require(plyr); require(dplyr);
+library(reshape2); library(e1071); library(ggplot2)
+if(!require(randomForest))
+  install.packages("randomForest")
+if(!require(rknn))
+  install.packages("rknn")
+opts_knit$set(root.dir="C:/HY/Projects/Barbell_lift_analysis")
+# download.file(paste("https://d396qusza40orc.cloudfront.net/predmachlearn/pml",
+#                     "-training.csv", sep=""),
+#               "pml-training.csv")
+# download.file(paste("https://d396qusza40orc.cloudfront.net/predmachlearn/pml",
+#                     "-testing.csv", sep=""),
+#               "pml-testing.csv")
+pmlTr<-read.csv("pml-training.csv", stringsAsFactors = TRUE)
+pmlTe<-read.csv("pml-testing.csv", stringsAsFactors = TRUE)
+names(pmlTr)
+# install.packages("glmnet")
+```
+
+# Data preparation and transformation
+
+The preliminary step of this analysis is to conduct some exploratory data analysis. As the first three columns to the right of `X` and `user_name` were timestamps, the first question that sprang was whether a time series analysis would be germane. As there are only `r length(unique(as.Date(pmlTr$cvtd_timestamp, "%m/%d/%Y"))) - 1` unique dates, the answer to that question is no.
+
+```{r attempted imputation I, include=FALSE, warning=FALSE, cache=TRUE}
+stopifnot(ncol(pmlTr) == which(grepl("classe", names(pmlTr))))
+unique(as.Date(pmlTr$cvtd_timestamp, "%m/%d/%Y"))
+# convert numeric variables with "#DIV-0" that were parsed as characters
+idxNewWindow<-which(grepl("new_window", names(pmlTr)))
+logiImproperFctr<-sapply(seq(idxNewWindow+1, ncol(pmlTr)-1),
+                         function(k) is.factor(pmlTr[,k]))
+idxImproperFctr<-which(logiImproperFctr)+idxNewWindow
+pmlTr[,idxImproperFctr]<-sapply(idxImproperFctr, function(k)
+  as.numeric(as.character(pmlTr[,k])))
+
+# exclude factor "predictors" and outcome variable
+ssPmlTr<-pmlTr %>% select(-c(seq(idxNewWindow-1),ncol(pmlTr)))
+# NA counts in each column
+beforeNA<-apply(ssPmlTr, MARGIN=2, function(x) sum(is.na(x)))
+rangePctMissing<-round(100 *
+                         range(Filter(function(x) x > 0,
+                                      beforeNA / nrow(pmlTr))),
+                       1)
+```
+
+Next, the issue of missing observations among the numeric predictors was examined using the `method=bagImpute` in the `preProcess` function of the `caret` library. The "imputed" data frame, stored in `ssTrImputed` had the exact same numeric predictor indices result in an `NA` as those of the pre-imputed data frame, `ssPmlTr`. This is not surprising, since between `r rangePctMissing[1]`% and `r rangePctMissing[2]`% of the observations were missing whenever a predictor had any `NA` values. Thus, the author decided to proceed in the analysis by removing all categorical/text predictors (`X`, `user_name`, `raw_timestamp_part_1`, `raw_timestamp_part_2`, and `cvtd_timestamp`) from the predictor data frame.
+```{r attempted imputation II and PCA, include=FALSE, warning=FALSE, cache=TRUE}
+preImpute<-preProcess(ssPmlTr, method="bagImpute")
+ssTrImputed<-predict(preImpute, ssPmlTr)
+afterNA<-apply(ssTrImputed, MARGIN=2, function(x) sum(is.na(x)))
+idxMissing<-which(beforeNA != 0)
+all(afterNA[idxMissing] - beforeNA[idxMissing] == 0)
+# not needed anymore
+rm(preImpute); rm(ssTrImputed)
+
+ssPmlTr<-pmlTr %>%
+  select(-c(seq(idxNewWindow),ncol(pmlTr)))
+
+# remove predictors with any NA values
+idxNonNA<-apply(ssPmlTr, MARGIN=2, function(x) all(!is.na(x)))
+
+cvtToInt<-function(x) {
+  return(as.integer(x)-1)
+}
+processTest<-function(df) {
+  dfComplete<-df %>%
+    select(-c(seq(idxNewWindow),ncol(pmlTr)))
+  dfNonMissingTe<-data.frame(new_window=cvtToInt(df$new_window),
+                             dfComplete[,idxNonNA])
+  all(apply(dfComplete, MARGIN=2, function(x) all(!is.na(x))) == idxNonNA)
+  return(predict(pcaPreProc, dfNonMissingTe))
+}
+
+dfNonmissingTr<-data.frame(#user_name=pmlTr$user_name,
+  # remove user_name as a potential new user may render user_name irrelevant
+  new_window=cvtToInt(pmlTr$new_window),
+  ssPmlTr[,idxNonNA])
+pcaPreProc<-preProcess(dfNonmissingTr, method="pca")
+names(pcaPreProc)
+pcaStats<-prcomp(dfNonmissingTr, center=TRUE, scale=TRUE)
+```
+
+Before any models were trained, Principal Components Analysis (PCA) was performed to reduce the number of predictors from `r ncol(dfNonmissingTr)` (without any missing observations) to `r min(which(summary(pcaStats)$importance[3,] > 0.95))`. The models considered for final presentation were bagged K-nearest neighbors (available in the package `rknn`), random forests, linear discriminant analysis, (LDA) and Support Vector Machines (SVM) with an automated selection of kernel. To potentially reduce overfitting, using `createDataPartitition` in the `caret` package, the training set was divided into a "sub-train" set of `length(idxSS)` observations, or around 80% of the original total.
+
+# Cross-validation and model construction
+Explicit cross-validation was performed only twice, once using the `rknn.cv` function in the `rknn` package to obtain the "sub-train" predictions. The second time was to confirm, using the `rfcv` function in the `randomForest` package, that the predictive accuracy and kappa score were best when all `r min(which(summary(pcaStats)$importance[3,] > 0.95))` variables of the PCA-reduced training set were used. Otherwise, cross-validation on resampling was performed using `trainControl` in `caret` by setting `method` to equal `cv`. As this is a classification problem, `classProbs` was also set to `TRUE`.
+```{r modelling on PCA-trimmed set, cache=TRUE, warning=FALSE}
+trCtrl <- trainControl(method = "cv", savePred=T, classProbs=T)
+idxSS<-createDataPartition(y=pmlTr$classe, p=0.8, list=FALSE)
+dfSample<-dfNonmissingTr[idxSS,]
+
+samplePC<-predict(pcaPreProc, dfSample)
+classesSample<-pmlTr$classe[idxSS]
+oosPC<-processTest(pmlTr[-idxSS,])
+classesOOS<-pmlTr$classe[-idxSS]
+
+# bagged KNN; see rknn package #
+# pcaFitRKNN<-rknn(data=samplePC, newdata=oosPC, y=classesSample)
+rknnSample<-rknn.cv(data=samplePC, y=classesSample)
+confusionMatrix(rknnSample$pred, classesSample)
+
+# Random forest #
+pcaRFCV<-rfcv(samplePC, classesSample)
+pcaRFCV$error.cv
+# Random Forest with built-in CV via trControl argument #
+## with actual model
+pcaRF<-train(x=samplePC, y=classesSample, method="rf", trControl=trCtrl)
+rfOptimumMtry<-pcaRF$results$mtry[which.max(pcaRF$results$Accuracy)]
+predPcaRF<-pcaRF$pred %>% filter(mtry==rfOptimumMtry)
+with(predPcaRF, confusionMatrix(pred, obs))
+
+## LDA ##
+pcaFitLDA<-train(x=samplePC, y=classesSample, method="lda",
+                 trControl = trCtrl)
+pcaFitLDA
+## SVM ##
+# pcaFitSVM_lin<-train(x=samplePC, y=classesSample, method="svmLinear",
+#                      trControl = trCtrl) # fails on Linear and Poly
+pcaFitSVM_auto<-svm(x=samplePC, y=classesSample, cross=10, probability=T)
+
+print("Confusion matrix of radial SVM on training set:")
+confusionMatrix(pcaFitSVM_auto$fitted, classesSample)
+```
+
+```{r warning=FALSE,message=FALSE, include=FALSE}
+ldaAccu<-as.double(plyr::summarise(pcaFitLDA$pred, rate=sum(pred == obs) /
+                                     nrow(pcaFitLDA$pred)))
+```
+
+As the "sub-train" set accuracy from LDA stood at `r round(ldaAccu,4)`, well below the next-"worst" performer of SVM with a radial kernel, at `r round(sum(pcaFitSVM_auto$fitted == classesSample) / length(classesSample),4)`, LDA was removed from consideration for any ensembling. The ensembling was a stacking of the three base models using gradient boosting.
+
+```{r ensembling, cache=TRUE, warning=FALSE, message=FALSE}
+predPcaRF<-predPcaRF[order(predPcaRF$rowIndex),]
+predPcaRKNN<-rknnSample$pred
+
+dfEnsemble<-data.frame(rf=predPcaRF$pred,
+                       rknn=predPcaRKNN,
+                       svmRad=pcaFitSVM_auto$fitted)
+gbmGarbage<-capture.output(
+  gbmPCA<-train(dfEnsemble, classesSample, method="gbm",
+                trControl = trCtrl))
+rm(gbmGarbage)
+gbmPCA
+bGBMimproved<-max(gbmPCA$results$Accuracy) >
+  max(c(max(pcaRF$results$Accuracy),
+        sum(predPcaRKNN==classesSample) / length(idxSS),
+        sum(pcaFitSVM_auto$fitted==classesSample) / length(idxSS)))
+```
+
+```{r prep for visuals, include=FALSE, warning=FALSE, message=FALSE}
+require(dplyr); require(reshape2); require(caret)
+NUM_MODELS<-ncol(dfEnsemble)
+baseAgree<-apply(dfEnsemble,
+                 MARGIN=1,
+                 FUN=function(x) length(unique(x))==1)
+
+dfBooleanTrio<-mutate(dfEnsemble,
+                      rf=rf != classesSample,
+                      rknn=rknn != classesSample,
+                      svmRad=svmRad != classesSample)
+
+baseAnyCorr<-apply(dfBooleanTrio,
+                   MARGIN=1,
+                   FUN=function(x) !all(x))
+
+dfPredsTrio<-data.frame(samplePC[,seq(2)],
+                        actualClass=classesSample,
+                        dfBooleanTrio,
+                        agrees=baseAgree,
+                        anyCorrect=baseAnyCorr,
+                        numCorrect=NUM_MODELS-
+                          apply(dfBooleanTrio, MARGIN=1, FUN=sum))
+tmp<-mutate(dfPredsTrio,
+            errorClass=as.factor(ifelse(agrees,
+                                        ifelse(!rknn,
+                                               "Correct",
+                                               "Incorrect"),
+                                        ifelse(anyCorrect,
+                                               "Disagree-Some correct",
+                                               "Disagree-Incorrect")
+            )))
+tmp2<-mutate(tmp,
+             errorClass=factor(errorClass,
+                               levels=c("Correct",
+                                        "Disagree-Some correct",
+                                        "Disagree-Incorrect",
+                                        "Incorrect")))
+dfPredsTrio<-select(tmp2, -c(anyCorrect, numCorrect))
+rm(tmp); rm(tmp2)
+
+meltedDf<-melt(dfPredsTrio, id=c("PC1",
+                                 "PC2",
+                                 "actualClass",
+                                 "agrees",
+                                 "errorClass")) %>%
+  dplyr::rename(method=variable,
+                isFalsePred=value)
+errorMelt<-meltedDf %>% filter(isFalsePred)
+
+idxMaxGBMaccu<-which.max(gbmPCA$results$Accuracy)
+gbmPreds<-gbmPCA$pred %>%
+  filter(interaction.depth==gbmPCA$results$interaction.depth[idxMaxGBMaccu],
+         n.trees==gbmPCA$results$n.trees[idxMaxGBMaccu])
+gbmPreds<-gbmPreds[order(gbmPreds$rowIndex),]
+dfGBMquartet<-data.frame(dfPredsTrio,
+                         gbm=gbmPreds$pred != classesSample)
+
+dfGBMquartet<-dfGBMquartet %>%
+  mutate(baseAnyCorr=errorClass %in% levels(errorClass)[seq(1:2)]) %>%
+  mutate(corrected=!gbm & !baseAnyCorr,
+         chose=!gbm & !agrees & baseAnyCorr,
+         changedToError=gbm & baseAnyCorr)
+```
+
+The overall "sub-train" accuracy of the GBM ensemble model was `r round(1-sum(dfGBMquartet$gbm) / nrow(dfGBMquartet),4)`, compared to the most accurate base model, RKNN, at `r round(1-sum(dfPredsTrio$rknn)/nrow(dfPredsTrio),4)`. The ensemble model correctly labelled classes in `r sum(dfGBMquartet$corrected)` "sub-train" cases where at least one of the three base models chose incorrectly, but, did not manage to correct _any_ labels in cases where _all_ three base models incorrectly predicted the action; there were `r sum(dfPredsTrio$errorClass=="Incorrect")`, or `r round(100 * sum(dfPredsTrio$errorClass=="Incorrect") / nrow(dfPredsTrio),2)`% of the sub-train cases. This latter case is to be expected as GBM operates on a multitude of decision trees; when all the base classifications are incorrect, the trees can only branch from a set of incorrect predictions.
+```{r gbm confusion}
+if(bGBMimproved)
+  with(gbmPreds, confusionMatrix(pred, obs))
+```
+
+# Visuals
+The first plot, displaying the location of all "sub-train" set errors in each of the three base models, elucidates several patterns, regardless of the choice. First, there is a preponderance among all three base models of incorrect classifications when the actual class was "D". This confirms the fact that "D" had the lowest specificity $P(\hat{Y}_i=D\|Y_i=D)$ in all of the `confusionMatrix` outputs. Second, while radial SVM had the lowest specificity across all classes, the decline in specificity was most noticeable in this "D" class, within the region bound by $\text{PC}_1 \in [-3,0] \land \text{PC}_2\in[3.75,6]$.
+```{r visuals I}
+ggplot(errorMelt) +
+  geom_point(aes(x=PC1, y=PC2,
+                 colour=actualClass, alpha=agrees,
+                 shape=ifelse(agrees, "Agree", "Disagree"))) +
+  facet_grid(.~method) +
+  scale_alpha_discrete(range=c(0.9,0.3)) +
+  scale_shape_manual(name="", values=c(Disagree=4,Agree=19)) +
+  ggtitle("Errors for each base method")
+```
+
+```{r rknn for plots, include=FALSE}
+idxErrorRKNN<-which(dfPredsTrio$rknn)
+dfRKNN<-data.frame(samplePC[,seq(2)],
+                   actualClass=classesSample,
+                   isError=predPcaRKNN != classesSample)
+```
+
+Now, a look at the classes predicted by `RKNN` and graphed by the first two principal components; `alpha` is set to $0.1$ to highlight density of classes.
+```{r visuals II}
+ggplot(dfPredsTrio[-idxErrorRKNN,]) +
+  geom_point(aes(x=PC1, y=PC2, colour=actualClass), alpha=0.1) +
+  geom_point(data=dfPredsTrio[idxErrorRKNN,], aes(x=PC1, y=PC2),
+             shape=4) +
+  # force legend to have default transparency level
+  guides(colour = guide_legend(override.aes=list(alpha=1))) +
+  ggtitle(paste("(RKNN) Predictions by first two pcs,",
+                " errors demarcated with crosses", sep=""))
+```
+
+The next plot of `RKNN` predictions further demonstrates the gaps in specificity by actual class. Again the region defined by $\text{PC}_1 \in [-3,0] \land \text{PC}_2\in[3.75,6]$ has a preponderance of failure to predict class `D`, but this plot demonstrates the significant overlap in that region with classes `B` and `C` as well as the remaining two classes to a lesser degree.
+```{r visuals III}
+ggplot(dfRKNN) +
+  facet_grid(.~actualClass) +
+  geom_point(aes(x=PC1, y=PC2, alpha=isError,
+                 color=ifelse(isError,
+                              "Incorrect",
+                              "Correct"),
+                 shape=ifelse(isError,
+                              "Incorrect",
+                              "Correct"))) +
+  scale_colour_manual(name="", values=c(Incorrect="Red",Correct="Black")) +
+  scale_alpha_discrete(range=c(0.025,1), guide=FALSE) + # remove legend
+  scale_shape_manual(name="", values=c(Incorrect=4,Correct=19)) +
+  ggtitle("(RKNN) Error by actual class")
+```
+
+```{r out-of-sample and test cases, cache=TRUE}
+predictTest<-function(df, testLabels) {
+  # df is a pca-preprocessed data frame
+  stopifnot(ncol(df) == ncol(samplePC))
+  stopifnot(all(levels(testLabels) == levels(classesSample)))
+  fitRKNN<-rknn(data=samplePC, newdata=df, y=classesSample)
+  # fitRKNN<-pcaFitRKNN
+  testRF<-predict(pcaRF, df)
+  testSVM<-predict(pcaFitSVM_auto, df)
+  testEnsemble<-data.frame(rf=testRF,
+                           rknn=fitRKNN$pred,
+                           svmRad=testSVM)
+  testGBM<-predict(gbmPCA, testEnsemble)
+  return(testGBM)
+}
+oosGBM<-predictTest(oosPC, classesOOS)
+```
+Based on the "sub-test" results, a lower bound for the out-of-sample error is `r round(sum(oosGBM!=classesOOS) / length(classesOOS),4)`.
